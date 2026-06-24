@@ -28,6 +28,7 @@ DEFAULT_WHISPER_LANGUAGE = "en"
 DEFAULT_ENABLE_LLM_FORMATTING = True
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
+SUBPROCESS_TEXT_ENCODING = "utf-8"
 
 FORMAT_PROMPT = """You are formatting a raw speech-to-text transcript.
 
@@ -157,6 +158,8 @@ def check_formatting_backend() -> tuple[bool, str]:
         completed = subprocess.run(
             ["ollama", "show", OLLAMA_MODEL],
             text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors="replace",
             capture_output=True,
             timeout=30,
         )
@@ -190,6 +193,8 @@ def format_transcript_markdown(raw_text: str) -> tuple[str | None, str]:
             command,
             input=raw_text,
             text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors="replace",
             capture_output=True,
             check=True,
             timeout=OLLAMA_TIMEOUT_SECONDS,
