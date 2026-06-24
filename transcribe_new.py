@@ -1,10 +1,12 @@
 from pathlib import Path
 from typing import Any
+import os
 import subprocess
 import sys
 
 IN_DIR = Path("in")
 OUT_DIR = Path("out")
+ENV_FILE = Path(".env")
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -18,11 +20,11 @@ SUPPORTED_EXTENSIONS = {
     ".mov",
 }
 
-MODEL_SIZE = "base"
-WHISPER_LANGUAGE = "en"
-ENABLE_LLM_FORMATTING = True
-OLLAMA_MODEL = "qwen2.5:3b"
-OLLAMA_TIMEOUT_SECONDS = 120
+DEFAULT_MODEL_SIZE = "base"
+DEFAULT_WHISPER_LANGUAGE = "en"
+DEFAULT_ENABLE_LLM_FORMATTING = True
+DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
 
 FORMAT_PROMPT = """You are formatting a raw speech-to-text transcript.
 
@@ -42,6 +44,58 @@ Rules:
 
 Return only the cleaned transcript text.
 """
+
+
+def load_dotenv(env_file: Path) -> None:
+    if not env_file.exists():
+        return
+
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def get_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        return int(value)
+    except ValueError:
+        print(f"Invalid integer for {name}: {value!r}. Using default {default}.")
+        return default
+
+
+load_dotenv(ENV_FILE)
+
+MODEL_SIZE = os.getenv("MODEL_SIZE", DEFAULT_MODEL_SIZE)
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", DEFAULT_WHISPER_LANGUAGE)
+ENABLE_LLM_FORMATTING = get_env_bool(
+    "ENABLE_LLM_FORMATTING",
+    DEFAULT_ENABLE_LLM_FORMATTING,
+)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+OLLAMA_TIMEOUT_SECONDS = get_env_int(
+    "OLLAMA_TIMEOUT_SECONDS",
+    DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+)
 
 
 def load_whisper_model() -> Any:
