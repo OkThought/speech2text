@@ -10,7 +10,8 @@ Main behavior:
 * Read existing transcripts from `out/`.
 * Match by stem/base name, ignoring extension.
 * Transcribe only inputs without `out/<stem>.txt`.
-* Save transcripts as `out/<stem>.txt`.
+* Save raw transcripts as `out/<stem>.txt`.
+* Optionally save formatted Markdown as `out/<stem>.md`.
 * Create `in/` and `out/` if missing.
 * Running `python transcribe_new.py` should process only new files.
 
@@ -41,6 +42,8 @@ Skip `interview.mp3`; transcribe `lecture.m4a`.
 * Do not hardcode filenames.
 * Keep config near the top.
 * Never overwrite existing `.txt` outputs unless an explicit overwrite flag is added later.
+* If Markdown formatting is enabled, write it to `.md`, not `.txt`.
+* If `.md` already exists, ask before regenerating it.
 * Handle errors per file so one failure does not stop the batch.
 * Print concise progress:
 
@@ -48,6 +51,7 @@ Skip `interview.mp3`; transcribe `lecture.m4a`.
   * skipped files
   * transcribed files
   * output paths
+  * formatting status
 
 ## Supported inputs
 

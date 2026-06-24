@@ -4,7 +4,7 @@
 
 It scans the `in/` folder for audio and video files, checks `out/` for existing transcripts with the same filename stem, and only transcribes files that do not already have an `out/<stem>.txt` file.
 
-After transcription, it can optionally run a second local formatting step through [Ollama](https://ollama.com/) to clean up punctuation, capitalization, spacing, and paragraph breaks. No paid APIs are used.
+After transcription, it can optionally run a second local formatting step through [Ollama](https://ollama.com/) to produce a separate Markdown version of the transcript. No paid APIs are used.
 
 ## What it does
 
@@ -12,8 +12,8 @@ After transcription, it can optionally run a second local formatting step throug
 - Finds supported media files in `in/`.
 - Skips files that already have a matching transcript in `out/`.
 - Transcribes new files locally with `faster-whisper`.
-- Optionally formats the raw transcript locally with an Ollama model.
-- Saves the final result as `out/<stem>.txt`.
+- Saves the raw transcript as `out/<stem>.txt`.
+- Optionally formats the raw transcript locally with an Ollama model into `out/<stem>.md`.
 - Handles errors per file so one failure does not stop the batch.
 
 ## Project structure
@@ -140,7 +140,9 @@ Outputs are written here:
 ```text
 out/
   meeting.txt
+  meeting.md
   demo.txt
+  demo.md
 ```
 
 If `out/meeting.txt` already exists, `meeting.mp3` will be skipped on the next run.
@@ -148,11 +150,13 @@ If `out/meeting.txt` already exists, `meeting.mp3` will be skipped on the next r
 ## Output behavior
 
 - The script never overwrites an existing `out/<stem>.txt`.
-- Each new file produces one output file.
-- If Ollama formatting succeeds, the saved text is the cleaned transcript.
-- If Ollama is unavailable, times out, or the model is missing, the raw transcript is saved instead.
+- Each new transcription produces a raw `.txt` file.
+- If Ollama formatting succeeds, the script also writes a formatted `.md` file.
+- If a matching `.md` already exists, the script asks whether you want to regenerate it.
+- If several `.md` files already exist, the script shows a checklist-style numbered prompt so you can choose which ones to regenerate.
+- If Ollama or the configured model is missing, transcription still runs and the script tells you what to install.
 
-This means transcription still works even if the local formatting step fails.
+This means transcription still works even if the local formatting step is skipped or fails.
 
 ## Console output
 
@@ -162,13 +166,14 @@ The script prints concise progress information, including:
 - skipped files
 - files being transcribed
 - formatting status
-- output path
+- raw output path
+- markdown output path when formatting runs
 
 ## Typical workflow
 
 1. Drop new recordings into `in/`.
 2. Run `python transcribe_new.py`.
-3. Collect finished `.txt` files from `out/`.
+3. Collect raw `.txt` files and optional formatted `.md` files from `out/`.
 4. Repeat later with more files; previously transcribed items are skipped automatically.
 
 ## Troubleshooting
@@ -183,7 +188,13 @@ pip install faster-whisper
 
 ### `ollama not found`
 
-Install Ollama locally, or disable formatting in `.env`:
+Install Ollama locally and pull the configured model:
+
+```bash
+ollama pull qwen3.5:9b
+```
+
+Or disable formatting in `.env`:
 
 ```env
 ENABLE_LLM_FORMATTING=false
@@ -203,4 +214,4 @@ Or change `OLLAMA_MODEL` in `.env` to a model you already have installed.
 
 - This project is designed for local use.
 - It does not depend on paid LLM APIs.
-- The formatting step is intentionally conservative: it is meant to improve readability, not rewrite the transcript into notes or summaries.
+- The formatting step is intentionally conservative: it is meant to improve readability in Markdown, not rewrite the transcript into notes or summaries.

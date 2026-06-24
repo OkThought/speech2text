@@ -1,12 +1,15 @@
 from pathlib import Path
 from typing import Any
 import os
+import shutil
 import subprocess
 import sys
 
 IN_DIR = Path("in")
 OUT_DIR = Path("out")
 ENV_FILE = Path(".env")
+RAW_TRANSCRIPT_SUFFIX = ".txt"
+FORMATTED_TRANSCRIPT_SUFFIX = ".md"
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -28,11 +31,15 @@ DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
 
 FORMAT_PROMPT = """You are formatting a raw speech-to-text transcript.
 
-Rewrite the transcript using only these allowed changes:
+Rewrite the transcript as clean Markdown using only these allowed changes:
 - fix capitalization
 - fix punctuation
 - fix spacing
 - split into readable paragraphs
+- add Markdown headings only when the transcript clearly introduces a section or topic
+- turn clearly spoken enumerations into Markdown bullet lists or numbered lists
+- preserve speaker turns in Markdown when the dialogue structure is obvious
+- keep wording natural while staying as close as possible to the original phrasing
 
 Rules:
 - do not summarize
@@ -41,8 +48,11 @@ Rules:
 - do not convert it into notes
 - keep the same language as the input
 - preserve names, numbers, and wording as closely as possible
+- do not invent section titles that are not supported by the transcript
+- do not use code fences
+- return valid plain Markdown only
 
-Return only the cleaned transcript text.
+Return only the cleaned Markdown transcript text.
 """
 
 
@@ -124,12 +134,54 @@ def transcribe_file(model: Any, audio_file: Path) -> str:
     return text
 
 
-def format_transcript(raw_text: str) -> tuple[str, str]:
-    if not ENABLE_LLM_FORMATTING:
-        return raw_text, "formatting disabled"
+def get_raw_output_path(input_file: Path) -> Path:
+    return OUT_DIR / f"{input_file.stem}{RAW_TRANSCRIPT_SUFFIX}"
 
+
+def get_formatted_output_path(input_file: Path) -> Path:
+    return OUT_DIR / f"{input_file.stem}{FORMATTED_TRANSCRIPT_SUFFIX}"
+
+
+def check_formatting_backend() -> tuple[bool, str]:
+    if not ENABLE_LLM_FORMATTING:
+        return False, "Formatting disabled."
+
+    if shutil.which("ollama") is None:
+        return (
+            False,
+            "Formatting skipped: Ollama is not installed. Install Ollama and run: "
+            f"ollama pull {OLLAMA_MODEL}",
+        )
+
+    try:
+        completed = subprocess.run(
+            ["ollama", "show", OLLAMA_MODEL],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            "Formatting skipped: Ollama did not respond in time while checking the "
+            f"model '{OLLAMA_MODEL}'.",
+        )
+    except Exception as exc:
+        return False, f"Formatting skipped: could not check Ollama model: {exc}"
+
+    if completed.returncode != 0:
+        return (
+            False,
+            f"Formatting skipped: Ollama model '{OLLAMA_MODEL}' is not installed. "
+            f"Run: ollama pull {OLLAMA_MODEL}",
+        )
+
+    return True, f"Formatting enabled with Ollama model '{OLLAMA_MODEL}'."
+
+
+def format_transcript_markdown(raw_text: str) -> tuple[str | None, str]:
     if not raw_text.strip():
-        return raw_text, "empty transcript"
+        return "", "empty transcript"
 
     command = ["ollama", "run", OLLAMA_MODEL, FORMAT_PROMPT]
 
@@ -143,9 +195,9 @@ def format_transcript(raw_text: str) -> tuple[str, str]:
             timeout=OLLAMA_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        return raw_text, "ollama not found; saved raw transcript"
+        return None, "ollama not found; markdown formatting skipped"
     except subprocess.TimeoutExpired:
-        return raw_text, "ollama timed out; saved raw transcript"
+        return None, "ollama timed out; markdown formatting skipped"
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip()
         if "pull" in stderr.lower() or "not found" in stderr.lower():
@@ -156,14 +208,85 @@ def format_transcript(raw_text: str) -> tuple[str, str]:
         elif stderr:
             message = f"ollama formatting failed: {stderr}"
         else:
-            message = "ollama formatting failed; saved raw transcript"
-        return raw_text, message
+            message = "ollama formatting failed; markdown formatting skipped"
+        return None, message
 
     formatted_text = completed.stdout.strip()
     if not formatted_text:
-        return raw_text, "ollama returned empty output; saved raw transcript"
+        return None, "ollama returned empty output; markdown formatting skipped"
 
-    return formatted_text, f"formatted with ollama ({OLLAMA_MODEL})"
+    return formatted_text, f"formatted markdown with ollama ({OLLAMA_MODEL})"
+
+
+def prompt_yes_no(message: str) -> bool:
+    while True:
+        answer = input(f"{message} [y/N]: ").strip().lower()
+        if not answer:
+            return False
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def prompt_markdown_regeneration(markdown_files: list[Path]) -> set[Path]:
+    if not markdown_files:
+        return set()
+
+    if not sys.stdin.isatty():
+        print("Markdown already exists; non-interactive mode detected, skipping regeneration.")
+        return set()
+
+    if len(markdown_files) == 1:
+        markdown_file = markdown_files[0]
+        should_regenerate = prompt_yes_no(
+            f"Formatted Markdown already exists for {markdown_file.name}. Regenerate it?"
+        )
+        return {markdown_file} if should_regenerate else set()
+
+    print("Formatted Markdown already exists for these files:")
+    for index, markdown_file in enumerate(markdown_files, start=1):
+        print(f"[ ] {index}. {markdown_file.name}")
+
+    print("Enter numbers separated by commas to regenerate, 'all' for every file, or press Enter to skip.")
+
+    while True:
+        answer = input("Selection: ").strip().lower()
+        if not answer:
+            return set()
+        if answer == "all":
+            return set(markdown_files)
+
+        selections: set[Path] = set()
+        valid = True
+
+        for part in answer.split(","):
+            item = part.strip()
+            if not item.isdigit():
+                valid = False
+                break
+
+            index = int(item)
+            if index < 1 or index > len(markdown_files):
+                valid = False
+                break
+
+            selections.add(markdown_files[index - 1])
+
+        if valid:
+            return selections
+
+        print("Please enter comma-separated numbers, 'all', or press Enter to skip.")
+
+
+def write_markdown_output(raw_output_file: Path, markdown_output_file: Path) -> str:
+    raw_transcript = raw_output_file.read_text(encoding="utf-8")
+    formatted_markdown, format_status = format_transcript_markdown(raw_transcript)
+    if formatted_markdown is None:
+        raise RuntimeError(format_status)
+    markdown_output_file.write_text(formatted_markdown.rstrip() + "\n", encoding="utf-8")
+    return format_status
 
 
 def main() -> None:
@@ -180,7 +303,7 @@ def main() -> None:
     files_to_process: list[Path] = []
 
     for input_file in input_files:
-        output_file = OUT_DIR / f"{input_file.stem}.txt"
+        output_file = get_raw_output_path(input_file)
         if output_file.exists():
             print(f"Skipped: {input_file.name} -> {output_file}")
             continue
@@ -188,26 +311,66 @@ def main() -> None:
 
     if not files_to_process:
         print("All matching transcripts already exist.")
-        return
 
-    model = load_whisper_model()
+    formatting_ready, formatting_message = check_formatting_backend()
+    if ENABLE_LLM_FORMATTING:
+        print(formatting_message)
+
+    model = load_whisper_model() if files_to_process else None
 
     for input_file in files_to_process:
-        output_file = OUT_DIR / f"{input_file.stem}.txt"
+        output_file = get_raw_output_path(input_file)
         print(f"Transcribing: {input_file.name}")
 
         try:
             raw_transcript = transcribe_file(model, input_file)
-            final_transcript, format_status = format_transcript(raw_transcript)
-            output_file.write_text(final_transcript + "\n", encoding="utf-8")
+            output_file.write_text(raw_transcript.rstrip() + "\n", encoding="utf-8")
         except Exception as exc:
             print(f"Failed: {input_file.name}")
             print(f"Error: {exc}")
             continue
 
         print(f"Transcribed: {input_file.name}")
-        print(f"Formatting: {format_status}")
         print(f"Output: {output_file}")
+
+    if formatting_ready:
+        markdown_files_to_regenerate = [
+            get_formatted_output_path(input_file)
+            for input_file in input_files
+            if get_raw_output_path(input_file).exists()
+            and get_formatted_output_path(input_file).exists()
+        ]
+        markdown_files_to_generate = [
+            get_formatted_output_path(input_file)
+            for input_file in input_files
+            if get_raw_output_path(input_file).exists()
+            and not get_formatted_output_path(input_file).exists()
+        ]
+
+        selected_regenerations = prompt_markdown_regeneration(markdown_files_to_regenerate)
+        markdown_jobs = sorted(markdown_files_to_generate + list(selected_regenerations))
+
+        for markdown_output_file in markdown_jobs:
+            raw_output_file = OUT_DIR / f"{markdown_output_file.stem}{RAW_TRANSCRIPT_SUFFIX}"
+            print(f"Formatting: {raw_output_file.name} -> {markdown_output_file.name}")
+
+            try:
+                format_status = write_markdown_output(raw_output_file, markdown_output_file)
+            except Exception as exc:
+                print(f"Failed formatting: {raw_output_file.name}")
+                print(f"Error: {exc}")
+                continue
+
+            print(f"Formatted: {markdown_output_file}")
+            print(f"Formatting status: {format_status}")
+    elif ENABLE_LLM_FORMATTING and input_files:
+        existing_raw_outputs = [
+            get_raw_output_path(input_file)
+            for input_file in input_files
+            if get_raw_output_path(input_file).exists()
+        ]
+        if existing_raw_outputs:
+            print("Raw transcripts were saved or already available; Markdown formatting was skipped.")
 
     print("Done.")
 
