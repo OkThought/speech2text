@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any
 import os
+import re
 import sys
 
 IN_DIR = Path("in")
@@ -8,6 +9,7 @@ OUT_DIR = Path("out")
 ENV_FILE = Path(".env")
 RAW_TRANSCRIPT_SUFFIX = ".txt"
 FORMATTED_TRANSCRIPT_SUFFIX = ".md"
+CHUNKS_DIR = OUT_DIR / "chunks"
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -27,27 +29,34 @@ DEFAULT_ENABLE_LLM_FORMATTING = True
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
 DEFAULT_OLLAMA_THINK: bool | str = False
+DEFAULT_FORMAT_CHUNK_MAX_CHARS = 3000
+DEFAULT_FORMAT_SAVE_CHUNKS = True
+
+OLLAMA_TEMPERATURE = 0.1
+OLLAMA_TOP_P = 0.9
+OLLAMA_REPEAT_PENALTY = 1.1
+OLLAMA_NUM_PREDICT = 1200
 
 FORMAT_PROMPT = """You are formatting a raw speech-to-text transcript.
 
-Rewrite the transcript as clean Markdown using only these allowed changes:
-- fix capitalization
+Clean the transcript into readable Markdown using only these allowed changes:
 - fix punctuation
 - fix spacing
 - split into readable paragraphs
-- add Markdown headings only when the transcript clearly introduces a section or topic
-- turn clearly spoken enumerations into Markdown bullet lists or numbered lists
+- remove obvious false starts or repeated filler when the correction is unambiguous
+- add a conservative Markdown heading only when the transcript clearly introduces a section or topic
 - preserve speaker turns in Markdown when the dialogue structure is obvious
-- keep wording natural while staying as close as possible to the original phrasing
 
 Rules:
 - do not summarize
 - do not add facts
 - do not remove meaningful content
+- do not rewrite for style
 - do not convert it into notes
 - keep the same language as the input
 - preserve names, numbers, and wording as closely as possible
 - do not invent section titles that are not supported by the transcript
+- do not perform broad editing beyond punctuation, spacing, paragraphing, and clearly safe transcript cleanup
 - do not use code fences
 - return valid plain Markdown only
 
@@ -129,6 +138,14 @@ OLLAMA_THINK = get_env_ollama_think(
     "OLLAMA_THINK",
     DEFAULT_OLLAMA_THINK,
 )
+FORMAT_CHUNK_MAX_CHARS = get_env_int(
+    "FORMAT_CHUNK_MAX_CHARS",
+    DEFAULT_FORMAT_CHUNK_MAX_CHARS,
+)
+FORMAT_SAVE_CHUNKS = get_env_bool(
+    "FORMAT_SAVE_CHUNKS",
+    DEFAULT_FORMAT_SAVE_CHUNKS,
+)
 
 
 def load_whisper_model() -> Any:
@@ -163,6 +180,14 @@ def get_raw_output_path(input_file: Path) -> Path:
 
 def get_formatted_output_path(input_file: Path) -> Path:
     return OUT_DIR / f"{input_file.stem}{FORMATTED_TRANSCRIPT_SUFFIX}"
+
+
+def get_chunk_output_dir() -> Path:
+    return CHUNKS_DIR
+
+
+def get_chunk_output_path(stem: str, index: int) -> Path:
+    return get_chunk_output_dir() / f"{stem}_{index:03d}{FORMATTED_TRANSCRIPT_SUFFIX}"
 
 
 def check_formatting_backend() -> tuple[bool, str]:
@@ -223,21 +248,155 @@ def request_markdown_from_ollama(
         messages=format_prompt_messages(raw_text),
         stream=False,
         think=think_mode,
+        options={
+            "temperature": OLLAMA_TEMPERATURE,
+            "top_p": OLLAMA_TOP_P,
+            "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
     )
 
 
-def format_transcript_markdown(raw_text: str) -> tuple[str | None, str]:
-    if not raw_text.strip():
-        return "", "empty transcript"
+def normalize_transcript_text(raw_text: str) -> str:
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    text = re.sub(r"[^\S\n]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_long_segment(segment: str, max_chars: int) -> list[str]:
+    if len(segment) <= max_chars:
+        return [segment]
+
+    sentence_parts = re.split(r"(?<=[.!?])\s+", segment)
+    if len(sentence_parts) > 1:
+        return pack_segments(sentence_parts, max_chars, separator=" ")
+
+    pieces: list[str] = []
+    remaining = segment.strip()
+    while remaining:
+        if len(remaining) <= max_chars:
+            pieces.append(remaining)
+            break
+
+        split_at = remaining.rfind(" ", 0, max_chars + 1)
+        if split_at <= 0:
+            split_at = max_chars
+
+        pieces.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+
+    return [piece for piece in pieces if piece]
+
+
+def pack_segments(
+    segments: list[str],
+    max_chars: int,
+    separator: str = "\n\n",
+) -> list[str]:
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_length = 0
+
+    for segment in segments:
+        cleaned = segment.strip()
+        if not cleaned:
+            continue
+
+        if len(cleaned) > max_chars:
+            if current_parts:
+                chunks.append(separator.join(current_parts))
+                current_parts = []
+                current_length = 0
+            chunks.extend(split_long_segment(cleaned, max_chars))
+            continue
+
+        separator_length = len(separator) if current_parts else 0
+        projected_length = current_length + separator_length + len(cleaned)
+        if current_parts and projected_length > max_chars:
+            chunks.append(separator.join(current_parts))
+            current_parts = [cleaned]
+            current_length = len(cleaned)
+            continue
+
+        current_parts.append(cleaned)
+        current_length = projected_length
+
+    if current_parts:
+        chunks.append(separator.join(current_parts))
+
+    return chunks
+
+
+def split_transcript_chunks(normalized_text: str, max_chars: int) -> list[str]:
+    if not normalized_text:
+        return [""]
+
+    safe_max_chars = max(200, max_chars)
+    paragraphs = normalized_text.split("\n\n")
+    return pack_segments(paragraphs, safe_max_chars)
+
+
+def format_single_chunk(
+    client: Any,
+    chunk_text: str,
+    think_mode: bool | str,
+) -> tuple[str | None, bool]:
+    response = request_markdown_from_ollama(client, chunk_text, think_mode)
+    formatted_text = extract_formatted_markdown(response)
+    used_fallback = False
+
+    if not formatted_text and think_mode is not False:
+        response = request_markdown_from_ollama(client, chunk_text, False)
+        formatted_text = extract_formatted_markdown(response)
+        used_fallback = bool(formatted_text)
+
+    if not formatted_text:
+        return None, used_fallback
+
+    return formatted_text, used_fallback
+
+
+def assemble_formatted_markdown(formatted_chunks: list[str]) -> str:
+    cleaned_chunks = [chunk.strip() for chunk in formatted_chunks if chunk.strip()]
+    if not cleaned_chunks:
+        return ""
+
+    merged = "\n\n".join(cleaned_chunks)
+    merged = re.sub(r"\n{3,}", "\n\n", merged)
+    return merged.strip()
+
+
+def write_chunk_artifacts(stem: str, formatted_chunks: list[str]) -> list[Path]:
+    chunk_dir = get_chunk_output_dir()
+    chunk_dir.mkdir(exist_ok=True)
+
+    for existing_path in chunk_dir.glob(f"{stem}_*{FORMATTED_TRANSCRIPT_SUFFIX}"):
+        existing_path.unlink()
+
+    written_paths: list[Path] = []
+    for index, chunk_text in enumerate(formatted_chunks, start=1):
+        chunk_path = get_chunk_output_path(stem, index)
+        chunk_path.write_text(chunk_text.rstrip() + "\n", encoding="utf-8")
+        written_paths.append(chunk_path)
+
+    return written_paths
+
+
+def format_transcript_markdown(raw_text: str) -> tuple[str | None, str, list[str], bool]:
+    normalized_text = normalize_transcript_text(raw_text)
+    if not normalized_text:
+        return "", "empty transcript", [""], False
 
     try:
         import ollama
     except ImportError:
-        return None, "python package 'ollama' not found; markdown formatting skipped"
+        return None, "python package 'ollama' not found; markdown formatting skipped", [], False
 
     try:
         client = ollama.Client(timeout=OLLAMA_TIMEOUT_SECONDS)
-        response = request_markdown_from_ollama(client, raw_text, OLLAMA_THINK)
+        chunks = split_transcript_chunks(normalized_text, FORMAT_CHUNK_MAX_CHARS)
     except ollama.ResponseError as exc:
         if "pull" in str(exc).lower() or "not found" in str(exc).lower():
             message = (
@@ -246,28 +405,50 @@ def format_transcript_markdown(raw_text: str) -> tuple[str | None, str]:
             )
         else:
             message = f"ollama formatting failed: {exc}"
-        return None, message
+        return None, message, [], False
     except Exception as exc:
-        return None, f"ollama formatting failed: {exc}"
+        return None, f"ollama formatting failed: {exc}", [], False
 
-    formatted_text = extract_formatted_markdown(response)
+    formatted_chunks: list[str] = []
     used_fallback = False
-    if not formatted_text and OLLAMA_THINK is not False:
-        try:
-            response = request_markdown_from_ollama(client, raw_text, False)
-        except Exception:
-            response = None
-        else:
-            formatted_text = extract_formatted_markdown(response)
-            used_fallback = bool(formatted_text)
 
-    if not formatted_text:
-        return None, "ollama returned empty output; markdown formatting skipped"
+    try:
+        for chunk_text in chunks:
+            if not chunk_text:
+                formatted_chunks.append("")
+                continue
 
-    status = f"formatted markdown with ollama ({OLLAMA_MODEL})"
+            formatted_chunk, chunk_used_fallback = format_single_chunk(
+                client,
+                chunk_text,
+                OLLAMA_THINK,
+            )
+            if formatted_chunk is None:
+                return None, "ollama returned empty output; markdown formatting skipped", [], False
+
+            formatted_chunks.append(formatted_chunk)
+            used_fallback = used_fallback or chunk_used_fallback
+    except ollama.ResponseError as exc:
+        if "pull" in str(exc).lower() or "not found" in str(exc).lower():
+            return (
+                None,
+                f"ollama model '{OLLAMA_MODEL}' unavailable; run: ollama pull {OLLAMA_MODEL}",
+                [],
+                False,
+            )
+        return None, f"ollama formatting failed: {exc}", [], False
+    except Exception as exc:
+        return None, f"ollama formatting failed: {exc}", [], False
+
+    formatted_text = assemble_formatted_markdown(formatted_chunks)
+    status = f"formatted markdown with ollama ({OLLAMA_MODEL}); chunks={len(chunks)}"
+    if FORMAT_SAVE_CHUNKS:
+        status += "; chunk artifacts written"
+    else:
+        status += "; chunk artifacts disabled"
     if used_fallback:
-        status += "; retried with think=false after empty final response"
-    return formatted_text, status
+        status += "; retried with think=false after empty chunk response"
+    return formatted_text, status, formatted_chunks, True
 
 
 def prompt_yes_no(message: str) -> bool:
@@ -334,9 +515,13 @@ def prompt_markdown_regeneration(markdown_files: list[Path]) -> set[Path]:
 
 def write_markdown_output(raw_output_file: Path, markdown_output_file: Path) -> str:
     raw_transcript = raw_output_file.read_text(encoding="utf-8")
-    formatted_markdown, format_status = format_transcript_markdown(raw_transcript)
+    formatted_markdown, format_status, formatted_chunks, formatting_succeeded = format_transcript_markdown(raw_transcript)
     if formatted_markdown is None:
         raise RuntimeError(format_status)
+
+    if formatting_succeeded and FORMAT_SAVE_CHUNKS:
+        write_chunk_artifacts(markdown_output_file.stem, formatted_chunks)
+
     markdown_output_file.write_text(formatted_markdown.rstrip() + "\n", encoding="utf-8")
     return format_status
 

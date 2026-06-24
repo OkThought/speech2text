@@ -14,6 +14,7 @@ After transcription, it can optionally run a second local formatting step throug
 - Transcribes new files locally with `faster-whisper`.
 - Saves the raw transcript as `out/<stem>.txt`.
 - Optionally formats the raw transcript locally with an Ollama model into `out/<stem>.md`.
+- Optionally saves per-chunk formatted Markdown artifacts in `out/chunks/`.
 - Handles errors per file so one failure does not stop the batch.
 
 ## Project structure
@@ -106,6 +107,8 @@ ENABLE_LLM_FORMATTING=true
 OLLAMA_MODEL=qwen3.5:9b
 OLLAMA_TIMEOUT_SECONDS=120
 OLLAMA_THINK=false
+FORMAT_CHUNK_MAX_CHARS=3000
+FORMAT_SAVE_CHUNKS=true
 ```
 
 ### Settings
@@ -123,6 +126,10 @@ OLLAMA_THINK=false
 - `OLLAMA_THINK`: Ollama thinking mode for formatting
   - Allowed values: `false`, `true`, `low`, `medium`, `high`
   - Default: `false`
+- `FORMAT_CHUNK_MAX_CHARS`: target chunk size for transcript formatting requests
+  - Default: `3000`
+- `FORMAT_SAVE_CHUNKS`: saves formatted chunk artifacts under `out/chunks/`
+  - Default: `true`
 
 ## How to use it
 
@@ -146,6 +153,8 @@ Outputs are written here:
 out/
   meeting.txt
   meeting.md
+  chunks/
+    meeting_001.md
   demo.txt
   demo.md
 ```
@@ -157,9 +166,12 @@ If `out/meeting.txt` already exists, `meeting.mp3` will be skipped on the next r
 - The script never overwrites an existing `out/<stem>.txt`.
 - Each new transcription produces a raw `.txt` file.
 - If formatting is enabled and Ollama plus the configured model are available, the script writes a formatted `.md` file from each available raw transcript.
+- Formatting now preprocesses and splits long transcripts into stateless chunks before sending them to Ollama, then merges the chunk results deterministically.
+- When `FORMAT_SAVE_CHUNKS=true`, formatted runs also refresh `out/chunks/<stem>_NNN.md` files for the same transcript.
 - If a matching `.md` already exists, the script asks whether you want to regenerate it.
 - If several `.md` files already exist, the script shows a checklist-style numbered prompt so you can choose which ones to regenerate.
 - If Ollama or the configured model is missing, transcription still runs and the script tells you what to install.
+- If any formatting chunk fails, the script skips the final `.md` for that file, leaves the raw `.txt` untouched, and continues with the next file.
 - Existing raw `.txt` files can still be formatted on later runs even if no new transcription is needed.
 
 This means transcription still works even if the local formatting step is skipped or fails.
@@ -172,6 +184,7 @@ The script prints concise progress information, including:
 - skipped files
 - files being transcribed
 - formatting status
+- chunk count when formatting runs
 - raw output path
 - markdown output path when formatting runs
 
