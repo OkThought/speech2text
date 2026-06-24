@@ -4,7 +4,7 @@
 
 It scans the `in/` folder for audio and video files, checks `out/` for existing transcripts with the same filename stem, and only transcribes files that do not already have an `out/<stem>.txt` file.
 
-After transcription, it can optionally run a second local formatting step through [Ollama](https://ollama.com/) to produce a separate Markdown version of the transcript. No paid APIs are used.
+After transcription, it can optionally run a second local formatting step through [Ollama](https://ollama.com/) to produce a separate Markdown version of the transcript. Formatting is enabled by default, but it is only used when Ollama and the configured local model are available. No paid APIs are used.
 
 ## What it does
 
@@ -151,10 +151,11 @@ If `out/meeting.txt` already exists, `meeting.mp3` will be skipped on the next r
 
 - The script never overwrites an existing `out/<stem>.txt`.
 - Each new transcription produces a raw `.txt` file.
-- If Ollama formatting succeeds, the script also writes a formatted `.md` file.
+- If formatting is enabled and Ollama plus the configured model are available, the script writes a formatted `.md` file from each available raw transcript.
 - If a matching `.md` already exists, the script asks whether you want to regenerate it.
 - If several `.md` files already exist, the script shows a checklist-style numbered prompt so you can choose which ones to regenerate.
 - If Ollama or the configured model is missing, transcription still runs and the script tells you what to install.
+- Existing raw `.txt` files can still be formatted on later runs even if no new transcription is needed.
 
 This means transcription still works even if the local formatting step is skipped or fails.
 
@@ -174,7 +175,7 @@ The script prints concise progress information, including:
 1. Drop new recordings into `in/`.
 2. Run `python transcribe_new.py`.
 3. Collect raw `.txt` files and optional formatted `.md` files from `out/`.
-4. Repeat later with more files; previously transcribed items are skipped automatically.
+4. Repeat later with more files; previously transcribed items are skipped automatically, and existing `.md` files can be selectively regenerated.
 
 ## Troubleshooting
 
@@ -191,6 +192,7 @@ pip install faster-whisper
 Install Ollama locally and pull the configured model:
 
 ```bash
+ollama serve
 ollama pull qwen3.5:9b
 ```
 
@@ -209,6 +211,16 @@ ollama pull qwen3.5:9b
 ```
 
 Or change `OLLAMA_MODEL` in `.env` to a model you already have installed.
+
+### Formatting was skipped
+
+Formatting only runs when all of the following are true:
+
+- `ENABLE_LLM_FORMATTING=true`
+- `ollama` is installed and reachable
+- the configured `OLLAMA_MODEL` is already pulled locally
+
+If one of those is missing, the script still saves the raw `.txt` transcript and prints what to install or configure.
 
 ## Notes
 
