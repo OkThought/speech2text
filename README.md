@@ -61,12 +61,13 @@ You need:
 
 - Python 3.11+ recommended
 - `faster-whisper`
+- `ollama` Python package if you want transcript auto-formatting
 - Ollama installed locally if you want transcript auto-formatting
 
-Install the Python dependency:
+Install the Python dependencies:
 
 ```bash
-pip install faster-whisper
+pip install faster-whisper ollama
 ```
 
 If you want formatting enabled, install Ollama and pull a local model. The current recommended default is:
@@ -87,7 +88,7 @@ ollama pull qwen3.5:9b
 ### Windows PowerShell example
 
 ```powershell
-pip install faster-whisper
+pip install faster-whisper ollama
 Copy-Item .env.example .env
 python transcribe_new.py
 ```
@@ -104,6 +105,7 @@ WHISPER_LANGUAGE=en
 ENABLE_LLM_FORMATTING=true
 OLLAMA_MODEL=qwen3.5:9b
 OLLAMA_TIMEOUT_SECONDS=120
+OLLAMA_THINK=false
 ```
 
 ### Settings
@@ -118,6 +120,9 @@ OLLAMA_TIMEOUT_SECONDS=120
   - Default: `qwen3.5:9b`
 - `OLLAMA_TIMEOUT_SECONDS`: timeout for the formatting step
   - Default: `120`
+- `OLLAMA_THINK`: Ollama thinking mode for formatting
+  - Allowed values: `false`, `true`, `low`, `medium`, `high`
+  - Default: `false`
 
 ## How to use it
 
@@ -187,9 +192,17 @@ Install the dependency:
 pip install faster-whisper
 ```
 
-### `ollama not found`
+### `python package 'ollama' is not installed`
 
-Install Ollama locally and pull the configured model:
+Install the Python client:
+
+```bash
+pip install ollama
+```
+
+### Ollama is not reachable
+
+Make sure Ollama is installed and running locally, then pull the configured model:
 
 ```bash
 ollama serve
@@ -217,7 +230,8 @@ Or change `OLLAMA_MODEL` in `.env` to a model you already have installed.
 Formatting only runs when all of the following are true:
 
 - `ENABLE_LLM_FORMATTING=true`
-- `ollama` is installed and reachable
+- Python package `ollama` is installed
+- Ollama is installed and reachable
 - the configured `OLLAMA_MODEL` is already pulled locally
 
 If one of those is missing, the script still saves the raw `.txt` transcript and prints what to install or configure.

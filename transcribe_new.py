@@ -1,8 +1,6 @@
 from pathlib import Path
 from typing import Any
 import os
-import shutil
-import subprocess
 import sys
 
 IN_DIR = Path("in")
@@ -28,7 +26,7 @@ DEFAULT_WHISPER_LANGUAGE = "en"
 DEFAULT_ENABLE_LLM_FORMATTING = True
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
-SUBPROCESS_TEXT_ENCODING = "utf-8"
+DEFAULT_OLLAMA_THINK: bool | str = False
 
 FORMAT_PROMPT = """You are formatting a raw speech-to-text transcript.
 
@@ -94,6 +92,26 @@ def get_env_int(name: str, default: int) -> int:
         return default
 
 
+def get_env_ollama_think(name: str, default: bool | str) -> bool | str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+
+    print(
+        f"Invalid Ollama thinking setting for {name}: {value!r}. "
+        f"Using default {default!r}."
+    )
+    return default
+
+
 load_dotenv(ENV_FILE)
 
 MODEL_SIZE = os.getenv("MODEL_SIZE", DEFAULT_MODEL_SIZE)
@@ -106,6 +124,10 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
 OLLAMA_TIMEOUT_SECONDS = get_env_int(
     "OLLAMA_TIMEOUT_SECONDS",
     DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+)
+OLLAMA_THINK = get_env_ollama_think(
+    "OLLAMA_THINK",
+    DEFAULT_OLLAMA_THINK,
 )
 
 
@@ -147,80 +169,105 @@ def check_formatting_backend() -> tuple[bool, str]:
     if not ENABLE_LLM_FORMATTING:
         return False, "Formatting disabled."
 
-    if shutil.which("ollama") is None:
+    try:
+        import ollama
+    except ImportError:
         return (
             False,
-            "Formatting skipped: Ollama is not installed. Install Ollama and run: "
-            f"ollama pull {OLLAMA_MODEL}",
+            "Formatting skipped: Python package 'ollama' is not installed. "
+            "Install it with: pip install ollama",
         )
 
     try:
-        completed = subprocess.run(
-            ["ollama", "show", OLLAMA_MODEL],
-            text=True,
-            encoding=SUBPROCESS_TEXT_ENCODING,
-            errors="replace",
-            capture_output=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            False,
-            "Formatting skipped: Ollama did not respond in time while checking the "
-            f"model '{OLLAMA_MODEL}'.",
-        )
-    except Exception as exc:
-        return False, f"Formatting skipped: could not check Ollama model: {exc}"
-
-    if completed.returncode != 0:
+        client = ollama.Client(timeout=30)
+        client.show(OLLAMA_MODEL)
+    except ollama.ResponseError:
         return (
             False,
             f"Formatting skipped: Ollama model '{OLLAMA_MODEL}' is not installed. "
             f"Run: ollama pull {OLLAMA_MODEL}",
         )
+    except Exception as exc:
+        return False, f"Formatting skipped: could not reach Ollama: {exc}"
 
-    return True, f"Formatting enabled with Ollama model '{OLLAMA_MODEL}'."
+    think_mode = OLLAMA_THINK if isinstance(OLLAMA_THINK, str) else str(OLLAMA_THINK).lower()
+    return True, (
+        f"Formatting enabled with Ollama model '{OLLAMA_MODEL}' "
+        f"(think={think_mode})."
+    )
+
+
+def format_prompt_messages(raw_text: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": FORMAT_PROMPT},
+        {"role": "user", "content": raw_text},
+    ]
+
+
+def extract_formatted_markdown(response: Any) -> str:
+    message = getattr(response, "message", None)
+    if message is None:
+        return ""
+
+    content = getattr(message, "content", "")
+    return content.strip() if content else ""
+
+
+def request_markdown_from_ollama(
+    client: Any,
+    raw_text: str,
+    think_mode: bool | str,
+) -> Any:
+    return client.chat(
+        model=OLLAMA_MODEL,
+        messages=format_prompt_messages(raw_text),
+        stream=False,
+        think=think_mode,
+    )
 
 
 def format_transcript_markdown(raw_text: str) -> tuple[str | None, str]:
     if not raw_text.strip():
         return "", "empty transcript"
 
-    command = ["ollama", "run", OLLAMA_MODEL, FORMAT_PROMPT]
+    try:
+        import ollama
+    except ImportError:
+        return None, "python package 'ollama' not found; markdown formatting skipped"
 
     try:
-        completed = subprocess.run(
-            command,
-            input=raw_text,
-            text=True,
-            encoding=SUBPROCESS_TEXT_ENCODING,
-            errors="replace",
-            capture_output=True,
-            check=True,
-            timeout=OLLAMA_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        return None, "ollama not found; markdown formatting skipped"
-    except subprocess.TimeoutExpired:
-        return None, "ollama timed out; markdown formatting skipped"
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.strip()
-        if "pull" in stderr.lower() or "not found" in stderr.lower():
+        client = ollama.Client(timeout=OLLAMA_TIMEOUT_SECONDS)
+        response = request_markdown_from_ollama(client, raw_text, OLLAMA_THINK)
+    except ollama.ResponseError as exc:
+        if "pull" in str(exc).lower() or "not found" in str(exc).lower():
             message = (
                 f"ollama model '{OLLAMA_MODEL}' unavailable; run: ollama pull "
                 f"{OLLAMA_MODEL}"
             )
-        elif stderr:
-            message = f"ollama formatting failed: {stderr}"
         else:
-            message = "ollama formatting failed; markdown formatting skipped"
+            message = f"ollama formatting failed: {exc}"
         return None, message
+    except Exception as exc:
+        return None, f"ollama formatting failed: {exc}"
 
-    formatted_text = completed.stdout.strip()
+    formatted_text = extract_formatted_markdown(response)
+    used_fallback = False
+    if not formatted_text and OLLAMA_THINK is not False:
+        try:
+            response = request_markdown_from_ollama(client, raw_text, False)
+        except Exception:
+            response = None
+        else:
+            formatted_text = extract_formatted_markdown(response)
+            used_fallback = bool(formatted_text)
+
     if not formatted_text:
         return None, "ollama returned empty output; markdown formatting skipped"
 
-    return formatted_text, f"formatted markdown with ollama ({OLLAMA_MODEL})"
+    status = f"formatted markdown with ollama ({OLLAMA_MODEL})"
+    if used_fallback:
+        status += "; retried with think=false after empty final response"
+    return formatted_text, status
 
 
 def prompt_yes_no(message: str) -> bool:
